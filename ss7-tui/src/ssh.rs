@@ -192,14 +192,21 @@ impl Handler for SshSession {
                         should_quit = true;
                         break;
                     }
-                    // ESC (standalone, not part of a sequence)
+                    // ESC
                     27 => {
                         match app.screen {
                             Screen::Dashboard => {}
                             Screen::Confirm => {
-                                app.screen = Screen::AccountDetail;
+                                // Return to appropriate detail screen
+                                if app.selected_intercept.is_some() && app.selected_account.is_none() {
+                                    app.screen = Screen::CaleaDetail;
+                                } else if app.selected_forwarding.is_some() && app.selected_account.is_none() {
+                                    app.screen = Screen::PbxDetail;
+                                } else {
+                                    app.screen = Screen::AccountDetail;
+                                }
                             }
-                            Screen::CreditDebit => {
+                            Screen::CreditDebit | Screen::CaleaCreate | Screen::PbxCreate => {
                                 app.screen = Screen::AccountDetail;
                             }
                             Screen::AccountDetail => {
@@ -208,7 +215,13 @@ impl Handler for SshSession {
                                     app.refresh_accounts();
                                 }
                             }
-                            Screen::CreateAccount => {
+                            Screen::CaleaDetail => {
+                                app.go_to_calea_list();
+                            }
+                            Screen::PbxDetail => {
+                                app.go_to_pbx_list();
+                            }
+                            Screen::CaleaList | Screen::PbxList => {
                                 app.screen = Screen::Dashboard;
                                 app.refresh_dashboard();
                             }
@@ -224,9 +237,21 @@ impl Handler for SshSession {
                         Screen::SearchByName => app.do_search_by_name(),
                         Screen::SearchByBalance => app.do_search_by_balance(),
                         Screen::CreditDebit => app.apply_credit_debit(),
+                        Screen::CaleaCreate => app.create_intercept(),
+                        Screen::PbxCreate => app.create_forwarding_rule(),
                         Screen::AccountList => {
                             if !app.accounts.is_empty() {
                                 app.select_account();
+                            }
+                        }
+                        Screen::CaleaList => {
+                            if !app.intercepts.is_empty() {
+                                app.select_intercept();
+                            }
+                        }
+                        Screen::PbxList => {
+                            if !app.forwarding_rules.is_empty() {
+                                app.select_forwarding();
                             }
                         }
                         _ => {}
@@ -243,6 +268,16 @@ impl Handler for SshSession {
                                     app.select_account();
                                 }
                             }
+                            Screen::CaleaList => {
+                                if !app.intercepts.is_empty() {
+                                    app.select_intercept();
+                                }
+                            }
+                            Screen::PbxList => {
+                                if !app.forwarding_rules.is_empty() {
+                                    app.select_forwarding();
+                                }
+                            }
                             _ => app.type_char(' '),
                         }
                     }
@@ -255,6 +290,8 @@ impl Handler for SshSession {
                                 '2' => app.go_to_create_account(),
                                 '3' => app.go_to_search_by_name(),
                                 '4' => app.go_to_search_by_balance(),
+                                '5' => app.go_to_calea_list(),
+                                '6' => app.go_to_pbx_list(),
                                 'q' | 'Q' => {
                                     should_quit = true;
                                 }
@@ -271,16 +308,35 @@ impl Handler for SshSession {
                                 'a' | 'A' => app.request_status_change(ss7_billing::AccountStatus::Active),
                                 'x' | 'X' => app.request_status_change(ss7_billing::AccountStatus::Closed),
                                 'd' | 'D' => app.request_delete(),
+                                'i' | 'I' => app.go_to_calea_create_for_account(),
+                                'f' | 'F' => app.go_to_pbx_create_for_account(),
+                                _ => {}
+                            },
+                            Screen::CaleaDetail => match ch {
+                                't' | 'T' => app.request_toggle_intercept(),
+                                'd' | 'D' => app.request_delete_intercept(),
+                                _ => {}
+                            },
+                            Screen::PbxDetail => match ch {
+                                't' | 'T' => app.request_toggle_forwarding(),
+                                'd' | 'D' => app.request_delete_forwarding(),
                                 _ => {}
                             },
                             Screen::Confirm => match ch {
                                 'y' | 'Y' => app.execute_confirm(),
                                 'n' | 'N' => {
-                                    app.screen = Screen::AccountDetail;
+                                    if app.selected_intercept.is_some() && app.selected_account.is_none() {
+                                        app.screen = Screen::CaleaDetail;
+                                    } else if app.selected_forwarding.is_some() && app.selected_account.is_none() {
+                                        app.screen = Screen::PbxDetail;
+                                    } else {
+                                        app.screen = Screen::AccountDetail;
+                                    }
                                 }
                                 _ => {}
                             },
-                            Screen::CreateAccount | Screen::CreditDebit => {
+                            Screen::CreateAccount | Screen::CreditDebit
+                            | Screen::CaleaCreate | Screen::PbxCreate => {
                                 app.type_char(ch);
                             }
                             Screen::SearchByName => {
@@ -289,6 +345,7 @@ impl Handler for SshSession {
                             Screen::SearchByBalance => {
                                 app.type_char(ch);
                             }
+                            _ => {}
                         }
                     }
                     _ => {}

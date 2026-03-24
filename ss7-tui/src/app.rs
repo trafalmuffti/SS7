@@ -1,4 +1,7 @@
-use ss7_billing::{Account, AccountStatus, BillingDb};
+use ss7_billing::{
+    Account, AccountStatus, BillingDb, ForwardingRule, ForwardingStatus, ForwardingType,
+    InterceptStatus, InterceptTarget, InterceptType,
+};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -11,6 +14,14 @@ pub enum Screen {
     SearchByBalance,
     CreditDebit,
     Confirm,
+    // CALEA screens
+    CaleaList,
+    CaleaCreate,
+    CaleaDetail,
+    // PBX screens
+    PbxList,
+    PbxCreate,
+    PbxDetail,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -22,6 +33,15 @@ pub enum InputField {
     SearchQuery,
     BalanceMin,
     BalanceMax,
+    // CALEA fields
+    CaleaWarrantId,
+    CaleaDestIp,
+    CaleaDestPort,
+    CaleaType,
+    // PBX fields
+    PbxDestAddress,
+    PbxForwardType,
+    PbxTimeout,
 }
 
 pub struct App {
@@ -46,6 +66,21 @@ pub struct App {
     pub account_count: usize,
     pub total_balance: f64,
     pub scroll_offset: usize,
+    // CALEA state
+    pub intercepts: Vec<InterceptTarget>,
+    pub selected_intercept: Option<InterceptTarget>,
+    pub input_warrant_id: String,
+    pub input_dest_ip: String,
+    pub input_dest_port: String,
+    pub calea_type_index: usize,
+    pub intercept_count: usize,
+    // PBX state
+    pub forwarding_rules: Vec<ForwardingRule>,
+    pub selected_forwarding: Option<ForwardingRule>,
+    pub input_pbx_dest: String,
+    pub pbx_type_index: usize,
+    pub input_pbx_timeout: String,
+    pub forwarding_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -54,12 +89,32 @@ pub enum ConfirmAction {
     SuspendAccount(String),
     ActivateAccount(String),
     CloseAccount(String),
+    DeleteIntercept(String),
+    ToggleIntercept(String, bool),
+    DeleteForwarding(String),
+    ToggleForwarding(String, bool),
 }
+
+pub const CALEA_TYPES: &[InterceptType] = &[
+    InterceptType::Full,
+    InterceptType::SignalingOnly,
+    InterceptType::Sms,
+    InterceptType::Data,
+];
+
+pub const PBX_TYPES: &[ForwardingType] = &[
+    ForwardingType::Unconditional,
+    ForwardingType::Busy,
+    ForwardingType::NoAnswer,
+    ForwardingType::NotReachable,
+];
 
 impl App {
     pub fn new(db: Arc<BillingDb>) -> Self {
         let account_count = db.get_account_count().unwrap_or(0);
         let total_balance = db.get_total_balance().unwrap_or(0.0);
+        let intercept_count = db.get_intercept_count().unwrap_or(0);
+        let forwarding_count = db.get_forwarding_count().unwrap_or(0);
 
         App {
             db,
@@ -83,12 +138,29 @@ impl App {
             account_count,
             total_balance,
             scroll_offset: 0,
+            // CALEA
+            intercepts: Vec::new(),
+            selected_intercept: None,
+            input_warrant_id: String::new(),
+            input_dest_ip: String::new(),
+            input_dest_port: String::new(),
+            calea_type_index: 0,
+            intercept_count,
+            // PBX
+            forwarding_rules: Vec::new(),
+            selected_forwarding: None,
+            input_pbx_dest: String::new(),
+            pbx_type_index: 0,
+            input_pbx_timeout: "20".to_string(),
+            forwarding_count,
         }
     }
 
     pub fn refresh_dashboard(&mut self) {
         self.account_count = self.db.get_account_count().unwrap_or(0);
         self.total_balance = self.db.get_total_balance().unwrap_or(0.0);
+        self.intercept_count = self.db.get_intercept_count().unwrap_or(0);
+        self.forwarding_count = self.db.get_forwarding_count().unwrap_or(0);
     }
 
     pub fn refresh_accounts(&mut self) {
@@ -216,7 +288,6 @@ impl App {
                     let action = if self.is_credit { "Credited" } else { "Debited" };
                     self.status_message =
                         format!("{} ${:.2}. New balance: ${:.2}", action, amount, new_balance);
-                    // Refresh the selected account
                     if let Ok(updated) = self.db.get_account(&account.id) {
                         self.selected_account = Some(updated);
                     }
@@ -301,10 +372,250 @@ impl App {
                         Err(e) => self.status_message = format!("Error: {}", e),
                     }
                 }
+                ConfirmAction::DeleteIntercept(id) => {
+                    match self.db.delete_intercept(&id) {
+                        Ok(()) => {
+                            self.status_message = "Intercept deleted".to_string();
+                            self.selected_intercept = None;
+                            self.refresh_dashboard();
+                            self.go_to_calea_list();
+                            return;
+                        }
+                        Err(e) => self.status_message = format!("Error: {}", e),
+                    }
+                }
+                ConfirmAction::ToggleIntercept(id, activate) => {
+                    let status = if activate {
+                        InterceptStatus::Active
+                    } else {
+                        InterceptStatus::Inactive
+                    };
+                    match self.db.update_intercept_status(&id, status) {
+                        Ok(()) => {
+                            let word = if activate { "activated" } else { "deactivated" };
+                            self.status_message = format!("Intercept {}", word);
+                            if let Ok(updated) = self.db.get_intercept(&id) {
+                                self.selected_intercept = Some(updated);
+                            }
+                        }
+                        Err(e) => self.status_message = format!("Error: {}", e),
+                    }
+                }
+                ConfirmAction::DeleteForwarding(id) => {
+                    match self.db.delete_forwarding_rule(&id) {
+                        Ok(()) => {
+                            self.status_message = "Forwarding rule deleted".to_string();
+                            self.selected_forwarding = None;
+                            self.refresh_dashboard();
+                            self.go_to_pbx_list();
+                            return;
+                        }
+                        Err(e) => self.status_message = format!("Error: {}", e),
+                    }
+                }
+                ConfirmAction::ToggleForwarding(id, activate) => {
+                    let status = if activate {
+                        ForwardingStatus::Active
+                    } else {
+                        ForwardingStatus::Inactive
+                    };
+                    match self.db.update_forwarding_status(&id, status) {
+                        Ok(()) => {
+                            let word = if activate { "activated" } else { "deactivated" };
+                            self.status_message = format!("Forwarding rule {}", word);
+                            if let Ok(updated) = self.db.get_forwarding_rule(&id) {
+                                self.selected_forwarding = Some(updated);
+                            }
+                        }
+                        Err(e) => self.status_message = format!("Error: {}", e),
+                    }
+                }
             }
         }
-        self.screen = Screen::AccountDetail;
+        // Return to appropriate detail screen
+        match self.screen {
+            Screen::Confirm => {
+                if self.selected_intercept.is_some() && self.selected_account.is_none() {
+                    self.screen = Screen::CaleaDetail;
+                } else if self.selected_forwarding.is_some() && self.selected_account.is_none() {
+                    self.screen = Screen::PbxDetail;
+                } else {
+                    self.screen = Screen::AccountDetail;
+                }
+            }
+            _ => {}
+        }
     }
+
+    // --- CALEA Methods ---
+
+    pub fn go_to_calea_list(&mut self) {
+        self.intercepts = self.db.list_intercepts().unwrap_or_default();
+        self.selected_index = 0;
+        self.selected_account = None;
+        self.screen = Screen::CaleaList;
+    }
+
+    pub fn go_to_calea_create_for_account(&mut self) {
+        self.input_warrant_id.clear();
+        self.input_dest_ip.clear();
+        self.input_dest_port = "9500".to_string();
+        self.calea_type_index = 0;
+        self.active_field = InputField::CaleaWarrantId;
+        self.screen = Screen::CaleaCreate;
+    }
+
+    pub fn create_intercept(&mut self) {
+        if self.input_warrant_id.is_empty() || self.input_dest_ip.is_empty() {
+            self.status_message = "Warrant ID and destination IP are required".to_string();
+            return;
+        }
+
+        let port: u16 = match self.input_dest_port.parse() {
+            Ok(p) if p > 0 => p,
+            _ => {
+                self.status_message = "Invalid port number".to_string();
+                return;
+            }
+        };
+
+        if let Some(ref account) = self.selected_account {
+            let intercept_type = CALEA_TYPES[self.calea_type_index].clone();
+            let target = InterceptTarget::new(
+                account.id.clone(),
+                self.input_warrant_id.clone(),
+                intercept_type,
+                self.input_dest_ip.clone(),
+                port,
+            );
+
+            match self.db.create_intercept(&target) {
+                Ok(()) => {
+                    self.status_message = format!(
+                        "CALEA intercept created: {} -> {}:{}",
+                        account.msisdn, target.dest_ip, target.dest_port
+                    );
+                    self.refresh_dashboard();
+                    self.screen = Screen::AccountDetail;
+                }
+                Err(e) => {
+                    self.status_message = format!("Error: {}", e);
+                }
+            }
+        }
+    }
+
+    pub fn select_intercept(&mut self) {
+        if let Some(intercept) = self.intercepts.get(self.selected_index) {
+            self.selected_intercept = Some(intercept.clone());
+            self.selected_account = None;
+            self.screen = Screen::CaleaDetail;
+        }
+    }
+
+    pub fn request_delete_intercept(&mut self) {
+        if let Some(ref intercept) = self.selected_intercept {
+            self.confirm_action = format!("Delete intercept (warrant {})?", intercept.warrant_id);
+            self.confirm_callback = Some(ConfirmAction::DeleteIntercept(intercept.id.clone()));
+            self.screen = Screen::Confirm;
+        }
+    }
+
+    pub fn request_toggle_intercept(&mut self) {
+        if let Some(ref intercept) = self.selected_intercept {
+            let activate = intercept.status == InterceptStatus::Inactive;
+            let action = if activate { "Activate" } else { "Deactivate" };
+            self.confirm_action = format!("{} intercept (warrant {})?", action, intercept.warrant_id);
+            self.confirm_callback = Some(ConfirmAction::ToggleIntercept(intercept.id.clone(), activate));
+            self.screen = Screen::Confirm;
+        }
+    }
+
+    // --- PBX Methods ---
+
+    pub fn go_to_pbx_list(&mut self) {
+        self.forwarding_rules = self.db.list_forwarding_rules().unwrap_or_default();
+        self.selected_index = 0;
+        self.selected_account = None;
+        self.screen = Screen::PbxList;
+    }
+
+    pub fn go_to_pbx_create_for_account(&mut self) {
+        self.input_pbx_dest.clear();
+        self.pbx_type_index = 0;
+        self.input_pbx_timeout = "20".to_string();
+        self.active_field = InputField::PbxDestAddress;
+        self.screen = Screen::PbxCreate;
+    }
+
+    pub fn create_forwarding_rule(&mut self) {
+        if self.input_pbx_dest.is_empty() {
+            self.status_message = "Destination address is required".to_string();
+            return;
+        }
+
+        let timeout: u32 = self.input_pbx_timeout.parse().unwrap_or(20);
+
+        if let Some(ref account) = self.selected_account {
+            let fwd_type = PBX_TYPES[self.pbx_type_index].clone();
+            let rule = ForwardingRule::new(
+                account.id.clone(),
+                account.msisdn.clone(),
+                self.input_pbx_dest.clone(),
+                fwd_type,
+                timeout,
+            );
+
+            let map_op = rule.ss7_map_operation();
+            match self.db.create_forwarding_rule(&rule) {
+                Ok(()) => {
+                    self.status_message = format!(
+                        "PBX rule created: {} -> {} [SS7: {}]",
+                        account.msisdn, rule.dest_address, map_op
+                    );
+                    self.refresh_dashboard();
+                    self.screen = Screen::AccountDetail;
+                }
+                Err(e) => {
+                    self.status_message = format!("Error: {}", e);
+                }
+            }
+        }
+    }
+
+    pub fn select_forwarding(&mut self) {
+        if let Some(rule) = self.forwarding_rules.get(self.selected_index) {
+            self.selected_forwarding = Some(rule.clone());
+            self.selected_account = None;
+            self.screen = Screen::PbxDetail;
+        }
+    }
+
+    pub fn request_delete_forwarding(&mut self) {
+        if let Some(ref rule) = self.selected_forwarding {
+            self.confirm_action = format!(
+                "Delete forwarding {} -> {}?",
+                rule.source_msisdn, rule.dest_address
+            );
+            self.confirm_callback = Some(ConfirmAction::DeleteForwarding(rule.id.clone()));
+            self.screen = Screen::Confirm;
+        }
+    }
+
+    pub fn request_toggle_forwarding(&mut self) {
+        if let Some(ref rule) = self.selected_forwarding {
+            let activate = rule.status == ForwardingStatus::Inactive;
+            let action = if activate { "Activate" } else { "Deactivate" };
+            self.confirm_action = format!(
+                "{} forwarding {} -> {}?",
+                action, rule.source_msisdn, rule.dest_address
+            );
+            self.confirm_callback = Some(ConfirmAction::ToggleForwarding(rule.id.clone(), activate));
+            self.screen = Screen::Confirm;
+        }
+    }
+
+    // --- Navigation ---
 
     pub fn move_selection_up(&mut self) {
         if self.selected_index > 0 {
@@ -313,7 +624,12 @@ impl App {
     }
 
     pub fn move_selection_down(&mut self) {
-        if !self.accounts.is_empty() && self.selected_index < self.accounts.len() - 1 {
+        let len = match self.screen {
+            Screen::CaleaList => self.intercepts.len(),
+            Screen::PbxList => self.forwarding_rules.len(),
+            _ => self.accounts.len(),
+        };
+        if len > 0 && self.selected_index < len - 1 {
             self.selected_index += 1;
         }
     }
@@ -325,8 +641,25 @@ impl App {
             (Screen::CreateAccount, InputField::Imsi) => InputField::Name,
             (Screen::SearchByBalance, InputField::BalanceMin) => InputField::BalanceMax,
             (Screen::SearchByBalance, InputField::BalanceMax) => InputField::BalanceMin,
+            // CALEA create: cycle through fields
+            (Screen::CaleaCreate, InputField::CaleaWarrantId) => InputField::CaleaDestIp,
+            (Screen::CaleaCreate, InputField::CaleaDestIp) => InputField::CaleaDestPort,
+            (Screen::CaleaCreate, InputField::CaleaDestPort) => InputField::CaleaType,
+            (Screen::CaleaCreate, InputField::CaleaType) => InputField::CaleaWarrantId,
+            // PBX create: cycle through fields
+            (Screen::PbxCreate, InputField::PbxDestAddress) => InputField::PbxForwardType,
+            (Screen::PbxCreate, InputField::PbxForwardType) => InputField::PbxTimeout,
+            (Screen::PbxCreate, InputField::PbxTimeout) => InputField::PbxDestAddress,
             _ => self.active_field.clone(),
         };
+    }
+
+    pub fn cycle_calea_type(&mut self) {
+        self.calea_type_index = (self.calea_type_index + 1) % CALEA_TYPES.len();
+    }
+
+    pub fn cycle_pbx_type(&mut self) {
+        self.pbx_type_index = (self.pbx_type_index + 1) % PBX_TYPES.len();
     }
 
     pub fn type_char(&mut self, c: char) {
@@ -338,6 +671,13 @@ impl App {
             InputField::SearchQuery => self.input_search.push(c),
             InputField::BalanceMin => self.input_balance_min.push(c),
             InputField::BalanceMax => self.input_balance_max.push(c),
+            InputField::CaleaWarrantId => self.input_warrant_id.push(c),
+            InputField::CaleaDestIp => self.input_dest_ip.push(c),
+            InputField::CaleaDestPort => self.input_dest_port.push(c),
+            InputField::CaleaType => self.cycle_calea_type(),
+            InputField::PbxDestAddress => self.input_pbx_dest.push(c),
+            InputField::PbxForwardType => self.cycle_pbx_type(),
+            InputField::PbxTimeout => self.input_pbx_timeout.push(c),
         }
     }
 
@@ -350,6 +690,13 @@ impl App {
             InputField::SearchQuery => { self.input_search.pop(); }
             InputField::BalanceMin => { self.input_balance_min.pop(); }
             InputField::BalanceMax => { self.input_balance_max.pop(); }
+            InputField::CaleaWarrantId => { self.input_warrant_id.pop(); }
+            InputField::CaleaDestIp => { self.input_dest_ip.pop(); }
+            InputField::CaleaDestPort => { self.input_dest_port.pop(); }
+            InputField::CaleaType => {}
+            InputField::PbxDestAddress => { self.input_pbx_dest.pop(); }
+            InputField::PbxForwardType => {}
+            InputField::PbxTimeout => { self.input_pbx_timeout.pop(); }
         }
     }
 }

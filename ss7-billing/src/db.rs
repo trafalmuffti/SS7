@@ -3,8 +3,10 @@ use rusqlite::{params, Connection};
 use std::sync::{Arc, Mutex};
 
 use crate::account::{Account, AccountStatus};
+use crate::calea::{InterceptStatus, InterceptTarget, InterceptType};
 use crate::cdr::{CallDetailRecord, CallType};
 use crate::error::{BillingError, Result};
+use crate::pbx::{ForwardingRule, ForwardingStatus, ForwardingType};
 
 #[derive(Clone)]
 pub struct BillingDb {
@@ -64,7 +66,40 @@ impl BillingDb {
             );
 
             CREATE INDEX IF NOT EXISTS idx_cdrs_account ON cdrs(account_id);
-            CREATE INDEX IF NOT EXISTS idx_cdrs_time ON cdrs(start_time);",
+            CREATE INDEX IF NOT EXISTS idx_cdrs_time ON cdrs(start_time);
+
+            CREATE TABLE IF NOT EXISTS calea_intercepts (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                warrant_id TEXT NOT NULL,
+                intercept_type TEXT NOT NULL DEFAULT 'full',
+                dest_ip TEXT NOT NULL,
+                dest_port INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (account_id) REFERENCES accounts(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_calea_account ON calea_intercepts(account_id);
+            CREATE INDEX IF NOT EXISTS idx_calea_status ON calea_intercepts(status);
+
+            CREATE TABLE IF NOT EXISTS pbx_forwarding (
+                id TEXT PRIMARY KEY,
+                source_account_id TEXT NOT NULL,
+                source_msisdn TEXT NOT NULL,
+                dest_address TEXT NOT NULL,
+                forwarding_type TEXT NOT NULL DEFAULT 'unconditional',
+                no_answer_timeout INTEGER NOT NULL DEFAULT 20,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (source_account_id) REFERENCES accounts(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_pbx_source ON pbx_forwarding(source_account_id);
+            CREATE INDEX IF NOT EXISTS idx_pbx_source_msisdn ON pbx_forwarding(source_msisdn);
+            CREATE INDEX IF NOT EXISTS idx_pbx_status ON pbx_forwarding(status);",
         )?;
         Ok(())
     }
@@ -282,6 +317,218 @@ impl BillingDb {
             |row| row.get(0),
         )?;
         Ok(total)
+    }
+
+    // --- CALEA Intercept Methods ---
+
+    pub fn create_intercept(&self, target: &InterceptTarget) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO calea_intercepts (id, account_id, warrant_id, intercept_type, dest_ip, dest_port, status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                target.id,
+                target.account_id,
+                target.warrant_id,
+                target.intercept_type.as_str(),
+                target.dest_ip,
+                target.dest_port,
+                target.status.as_str(),
+                target.created_at.to_rfc3339(),
+                target.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_intercepts(&self) -> Result<Vec<InterceptTarget>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, account_id, warrant_id, intercept_type, dest_ip, dest_port, status, created_at, updated_at
+             FROM calea_intercepts ORDER BY created_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| Ok(Self::row_to_intercept(row)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn get_intercepts_for_account(&self, account_id: &str) -> Result<Vec<InterceptTarget>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, account_id, warrant_id, intercept_type, dest_ip, dest_port, status, created_at, updated_at
+             FROM calea_intercepts WHERE account_id = ?1 ORDER BY created_at DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![account_id], |row| Ok(Self::row_to_intercept(row)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn get_intercept(&self, id: &str) -> Result<InterceptTarget> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, account_id, warrant_id, intercept_type, dest_ip, dest_port, status, created_at, updated_at
+             FROM calea_intercepts WHERE id = ?1",
+        )?;
+        Ok(stmt
+            .query_row(params![id], |row| Ok(Self::row_to_intercept(row)))
+            .map_err(|_| BillingError::AccountNotFound(format!("intercept {}", id)))?)
+    }
+
+    pub fn update_intercept_status(&self, id: &str, status: InterceptStatus) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute(
+            "UPDATE calea_intercepts SET status = ?1, updated_at = ?2 WHERE id = ?3",
+            params![status.as_str(), Utc::now().to_rfc3339(), id],
+        )?;
+        if updated == 0 {
+            return Err(BillingError::AccountNotFound(format!("intercept {}", id)));
+        }
+        Ok(())
+    }
+
+    pub fn delete_intercept(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let deleted = conn.execute("DELETE FROM calea_intercepts WHERE id = ?1", params![id])?;
+        if deleted == 0 {
+            return Err(BillingError::AccountNotFound(format!("intercept {}", id)));
+        }
+        Ok(())
+    }
+
+    pub fn get_intercept_count(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM calea_intercepts WHERE status = 'active'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
+    fn row_to_intercept(row: &rusqlite::Row) -> InterceptTarget {
+        InterceptTarget {
+            id: row.get(0).unwrap(),
+            account_id: row.get(1).unwrap(),
+            warrant_id: row.get(2).unwrap(),
+            intercept_type: InterceptType::from_str(&row.get::<_, String>(3).unwrap()),
+            dest_ip: row.get(4).unwrap(),
+            dest_port: row.get::<_, u32>(5).unwrap() as u16,
+            status: InterceptStatus::from_str(&row.get::<_, String>(6).unwrap()),
+            created_at: chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>(7).unwrap())
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            updated_at: chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>(8).unwrap())
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        }
+    }
+
+    // --- PBX Forwarding Methods ---
+
+    pub fn create_forwarding_rule(&self, rule: &ForwardingRule) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO pbx_forwarding (id, source_account_id, source_msisdn, dest_address, forwarding_type, no_answer_timeout, status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                rule.id,
+                rule.source_account_id,
+                rule.source_msisdn,
+                rule.dest_address,
+                rule.forwarding_type.as_str(),
+                rule.no_answer_timeout,
+                rule.status.as_str(),
+                rule.created_at.to_rfc3339(),
+                rule.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_forwarding_rules(&self) -> Result<Vec<ForwardingRule>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, source_account_id, source_msisdn, dest_address, forwarding_type, no_answer_timeout, status, created_at, updated_at
+             FROM pbx_forwarding ORDER BY created_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| Ok(Self::row_to_forwarding(row)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn get_forwarding_rules_for_account(&self, account_id: &str) -> Result<Vec<ForwardingRule>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, source_account_id, source_msisdn, dest_address, forwarding_type, no_answer_timeout, status, created_at, updated_at
+             FROM pbx_forwarding WHERE source_account_id = ?1 ORDER BY created_at DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![account_id], |row| Ok(Self::row_to_forwarding(row)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn get_forwarding_rule(&self, id: &str) -> Result<ForwardingRule> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, source_account_id, source_msisdn, dest_address, forwarding_type, no_answer_timeout, status, created_at, updated_at
+             FROM pbx_forwarding WHERE id = ?1",
+        )?;
+        Ok(stmt
+            .query_row(params![id], |row| Ok(Self::row_to_forwarding(row)))
+            .map_err(|_| BillingError::AccountNotFound(format!("forwarding rule {}", id)))?)
+    }
+
+    pub fn update_forwarding_status(&self, id: &str, status: ForwardingStatus) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute(
+            "UPDATE pbx_forwarding SET status = ?1, updated_at = ?2 WHERE id = ?3",
+            params![status.as_str(), Utc::now().to_rfc3339(), id],
+        )?;
+        if updated == 0 {
+            return Err(BillingError::AccountNotFound(format!("forwarding rule {}", id)));
+        }
+        Ok(())
+    }
+
+    pub fn delete_forwarding_rule(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let deleted = conn.execute("DELETE FROM pbx_forwarding WHERE id = ?1", params![id])?;
+        if deleted == 0 {
+            return Err(BillingError::AccountNotFound(format!("forwarding rule {}", id)));
+        }
+        Ok(())
+    }
+
+    pub fn get_forwarding_count(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pbx_forwarding WHERE status = 'active'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
+    fn row_to_forwarding(row: &rusqlite::Row) -> ForwardingRule {
+        ForwardingRule {
+            id: row.get(0).unwrap(),
+            source_account_id: row.get(1).unwrap(),
+            source_msisdn: row.get(2).unwrap(),
+            dest_address: row.get(3).unwrap(),
+            forwarding_type: ForwardingType::from_str(&row.get::<_, String>(4).unwrap()),
+            no_answer_timeout: row.get(5).unwrap(),
+            status: ForwardingStatus::from_str(&row.get::<_, String>(6).unwrap()),
+            created_at: chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>(7).unwrap())
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            updated_at: chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>(8).unwrap())
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        }
     }
 
     fn row_to_account(row: &rusqlite::Row) -> Account {
