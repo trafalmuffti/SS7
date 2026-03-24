@@ -1,0 +1,3 @@
+[workspace]
+members = ["ss7-billing", "ss7-tui"]
+resolver = "2"
